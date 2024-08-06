@@ -30,6 +30,7 @@
 #include "velox/serializers/PrestoSerializer.h"
 #include "velox/type/parser/TypeParser.h"
 #include "velox/dwio/dwrf/writer/Writer.h"
+#include "velox/functions/prestosql/types/JsonType.h"
 
 #include <utility>
 
@@ -366,12 +367,42 @@ void toCallInputsSql(
 
 std::string toCallSql(const core::CallTypedExprPtr& call) {
   std::stringstream sql;
-  sql << call->name() << "(";
-  toCallInputsSql(call->inputs(), sql);
-  /*if (call->name() == "cast") {
-    sql << " as " << toTypeSql(call->type());
-  }*/
-  sql << ")";
+  if (call->name() == "in") {
+    VELOX_CHECK_EQ(call->inputs().size(), 2);
+    toCallInputsSql({call->inputs()[0]}, sql);
+    sql << fmt::format(" in (", call->name());
+    toCallInputsSql({call->inputs()[1]}, sql);
+    sql << ")";
+  } else if (call->name() == "like") {
+    toCallInputsSql({call->inputs()[0]}, sql);
+    sql << fmt::format(" like ", call->name());
+    toCallInputsSql({call->inputs()[1]}, sql);
+    if (call->inputs().size() == 3) {
+      sql << " escape ";
+      toCallInputsSql({call->inputs()[2]}, sql);
+    }
+  } else if (call->name() == "or" || call->name() == "and") {
+    sql << "(";
+    const auto& inputs = call->inputs();
+    for (auto i = 0; i < inputs.size(); ++i) {
+      if (i > 0) {
+        sql << fmt::format(" {} ", call->name());
+      }
+      toCallInputsSql({inputs[i]}, sql);
+    }
+    sql << ")";
+  } else if (call->name() == "array_constructor") {
+    sql << "ARRAY[";
+    toCallInputsSql(call->inputs(), sql);
+    sql << "]";
+  } else {
+    sql << call->name() << "(";
+    toCallInputsSql(call->inputs(), sql);
+    /*if (call->name() == "cast") {
+      sql << " as " << toTypeSql(call->type());
+    }*/
+    sql << ")";
+  }
   return sql.str();
 }
 
@@ -401,6 +432,9 @@ std::string toConstantSql(const core::ConstantTypedExprPtr& constant) {
   if (constant->toString() == "null") {
     sql << fmt::format("cast(null as {})", toTypeSql(constant->type()));
   } else if (constant->type()->isVarchar()) {
+    if (isJsonType(constant->type())) {
+      sql << "json ";
+    }
     sql << "'" << escape(constant->valueVector()->toString(0)) << "'";
   } else if (constant->type()->isVarbinary()) {
     sql << "cast('" << escape(constant->valueVector()->toString(0)) << "' as varbinary)";
@@ -476,7 +510,7 @@ std::optional<std::string> PrestoQueryRunner::toSql(
   if (!isSupportedDwrfType(valuesNode->outputType())) {
     return std::nullopt;
   }
-  return "tmp";
+  return "tmp_expr";
 }
 
 std::optional<std::string> PrestoQueryRunner::toSql(
@@ -518,7 +552,7 @@ std::optional<std::string> PrestoQueryRunner::toSql(
     }
   }
 
-  sql << " FROM tmp";
+  sql << " FROM tmp_expr";
 
   if (!groupingKeys.empty()) {
     sql << " GROUP BY " << folly::join(", ", groupingKeys);
@@ -701,7 +735,7 @@ std::optional<std::string> PrestoQueryRunner::toSql(
     sql << ")";
   }
 
-  sql << " FROM tmp";
+  sql << " FROM tmp_expr";
 
   return sql.str();
 }
@@ -732,7 +766,7 @@ std::optional<std::string> PrestoQueryRunner::toSql(
     }
   }
 
-  sql << ") as row_number FROM tmp";
+  sql << ") as row_number FROM tmp_expr";
 
   return sql.str();
 }
@@ -796,7 +830,7 @@ std::optional<std::string> PrestoQueryRunner::toSql(
     }
   }
 
-  sql << "FORMAT = 'ORC')  AS SELECT * FROM tmp";
+  sql << "FORMAT = 'ORC')  AS SELECT * FROM tmp_expr";
   return sql.str();
 }
 
@@ -1023,7 +1057,7 @@ std::vector<velox::RowVectorPtr> PrestoQueryRunner::executeVector(
     return executeVector(sql, {rowVector}, resultType);
   }
 
-  auto tableDirectoryPath = createTable("tmp", input[0]->type());
+  auto tableDirectoryPath = createTable("tmp_expr", input[0]->type());
 
   // Create a new file in table's directory with fuzzer-generated data.
   auto newFilePath = fs::path(tableDirectoryPath)
